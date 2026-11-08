@@ -1,0 +1,8 @@
+# Requirements for Data Analysis Project
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+plotly
+
