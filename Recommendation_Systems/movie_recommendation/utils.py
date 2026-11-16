@@ -566,3 +566,84 @@ def select_hybrid_alpha(
         "n_fit": len(fit_df),
         "n_val": len(val_df),
     }
+
+
+# ─────────────────────────────────────────────
+# Phase 4: activity / cold-start analysis
+# ─────────────────────────────────────────────
+
+def per_user_ranking_at_k(
+    model,
+    train_matrix: pd.DataFrame,
+    test_df: pd.DataFrame,
+    k: int = 10,
+    rel_threshold: float = 4.0,
+) -> pd.DataFrame:
+    """
+    Per-user ranking metrics under the Phase 1 protocol.
+
+    Returns one row per evaluated user: user, precision@k, recall@k, ndcg@k.
+    """
+    rel_by_user = (
+        test_df[test_df["rating"] >= rel_threshold]
+        .groupby("user")["item"]
+        .apply(set)
+        .to_dict()
+    )
+    rows = []
+    for user, relevant in sorted(rel_by_user.items()):
+        if user not in train_matrix.index:
+            continue
+        scores = model.score_all(user).copy()
+        seen = train_matrix.loc[user].dropna().index
+        scores = scores.drop(index=seen, errors="ignore")
+        ranked = scores.sort_values(ascending=False).head(k)
+        topk_list = list(ranked.index)
+        hits = len(set(topk_list) & relevant)
+        gains = [1 if item in relevant else 0 for item in topk_list]
+        dcg = _dcg_at_k(gains, k)
+        ideal = _dcg_at_k([1] * min(k, len(relevant)), k)
+        rows.append(
+            {
+                "user": user,
+                "precision@k": hits / k,
+                "recall@k": hits / len(relevant),
+                "ndcg@k": (dcg / ideal) if ideal > 0 else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def train_activity_counts(train_df: pd.DataFrame) -> pd.Series:
+    """Return user → number of train ratings."""
+    return train_df.groupby("user").size().rename("n_train")
+
+
+def assign_activity_tertiles(counts: pd.Series, users) -> dict:
+    """
+    Label users as light / medium / heavy by tertiles of their train counts.
+
+    Tertile edges are computed on the provided users only. Returns
+    {labels: Series, edges: (t1, t2), counts_per_bin: dict}.
+    """
+    subset = counts.reindex(list(users)).dropna()
+    t1, t2 = np.quantile(subset.values, [1 / 3, 2 / 3])
+
+    def _label(n: float) -> str:
+        if n <= t1:
+            return "light"
+        if n <= t2:
+            return "medium"
+        return "heavy"
+
+    labels = subset.map(_label)
+    labels = labels.astype(
+        pd.CategoricalDtype(categories=["light", "medium", "heavy"], ordered=True)
+    )
+    counts_per_bin = labels.value_counts().reindex(["light", "medium", "heavy"]).fillna(0).astype(int)
+    print(
+        f"activity tertiles: light ≤ {t1:.0f} | "
+        f"medium ≤ {t2:.0f} | heavy > {t2:.0f} | "
+        f"n={dict(counts_per_bin)}"
+    )
+    return {"labels": labels, "edges": (float(t1), float(t2)), "counts_per_bin": dict(counts_per_bin)}
