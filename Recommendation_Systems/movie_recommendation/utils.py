@@ -444,3 +444,125 @@ def leakage_check(
         "n_overlap_pairs": n_overlap_pairs,
         "n_test_in_matrix": n_test_in_matrix,
     }
+
+
+# ─────────────────────────────────────────────
+# Hybrid SVD + content
+# ─────────────────────────────────────────────
+
+def minmax_normalize(scores: pd.Series) -> pd.Series:
+    """Map scores to [0, 1] per series; constant series becomes all zeros."""
+    lo, hi = float(scores.min()), float(scores.max())
+    if hi == lo:
+        return pd.Series(0.0, index=scores.index)
+    return (scores - lo) / (hi - lo)
+
+
+class HybridRecommender:
+    """
+    Blend SVD and content scores: alpha * svd_norm + (1 - alpha) * content_norm.
+
+    Alpha should be chosen on a train-only validation split (never the test set).
+    Ranking uses per-user min-max normalised score_all outputs; predict() blends
+    raw model predicts for optional RMSE only.
+    """
+
+    def __init__(self, svd_model, content_model, alpha: float):
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        self.svd = svd_model
+        self.content = content_model
+        self.alpha = float(alpha)
+
+    def score_all(self, user) -> pd.Series:
+        svd_n = minmax_normalize(self.svd.score_all(user))
+        content_n = minmax_normalize(self.content.score_all(user))
+        return self.alpha * svd_n + (1.0 - self.alpha) * content_n
+
+    def predict(self, user, item) -> float:
+        """Blend raw predicts (not min-max) for a soft RMSE figure."""
+        return float(
+            self.alpha * self.svd.predict(user, item)
+            + (1.0 - self.alpha) * self.content.predict(user, item)
+        )
+
+
+def select_hybrid_alpha(
+    train_df: pd.DataFrame,
+    item_embeddings: np.ndarray,
+    item_ids=None,
+    alphas=None,
+    k: int = 10,
+    rel_threshold: float = 4.0,
+    val_size: float = 0.2,
+    seed: int = 42,
+    n_components: int = 20,
+) -> dict:
+    """
+    Choose hybrid alpha on a validation split carved from train only.
+
+    Fits SVD + Content on the fit half, sweeps alphas by NDCG@k on val
+    (ties → higher P@k, then higher alpha). Never reads the held-out test set.
+
+    item_ids: catalog ids aligned with item_embeddings rows (typically full-train
+    M.columns). Required when the fit matrix has a different column order/set.
+    """
+    if alphas is None:
+        alphas = np.linspace(0.0, 1.0, 11)
+
+    fit_df, val_df = train_test_split_ratings(train_df, test_size=val_size, seed=seed)
+    M_fit = build_user_item(fit_df)
+
+    if item_ids is None:
+        if item_embeddings.shape[0] != M_fit.shape[1]:
+            raise ValueError(
+                "item_embeddings rows must match M_fit columns, or pass item_ids "
+                "aligned to the full-catalog embeddings"
+            )
+        emb_fit = item_embeddings
+    else:
+        id_to_row = {iid: i for i, iid in enumerate(item_ids)}
+        try:
+            rows = [id_to_row[iid] for iid in M_fit.columns]
+        except KeyError as exc:
+            raise ValueError(f"item_ids missing catalog item: {exc}") from exc
+        emb_fit = item_embeddings[rows]
+
+    svd_fit = SVDRecommender().fit(M_fit, n_components=n_components, seed=seed)
+    content_fit = ContentEmbeddingRecommender().fit(
+        M_fit, emb_fit, rel_threshold=rel_threshold
+    )
+
+    rows = []
+    for alpha in alphas:
+        hybrid = HybridRecommender(svd_fit, content_fit, alpha=float(alpha))
+        rank = ranking_metrics_at_k(
+            hybrid, M_fit, val_df, k=k, rel_threshold=rel_threshold
+        )
+        rows.append(
+            {
+                "alpha": float(alpha),
+                "P@10": rank["precision@k"],
+                "R@10": rank["recall@k"],
+                "NDCG@10": rank["ndcg@k"],
+                "n_users": rank["n_users_evaluated"],
+            }
+        )
+
+    val_curve = pd.DataFrame(rows)
+    ordered = val_curve.sort_values(
+        by=["NDCG@10", "P@10", "alpha"], ascending=[False, False, False]
+    )
+    best = ordered.iloc[0]
+    best_alpha = round(float(best["alpha"]), 1)
+    print(
+        f"select_hybrid_alpha: best_alpha={best_alpha:.1f} | "
+        f"val NDCG@10={best['NDCG@10']:.4f} | "
+        f"val P@10={best['P@10']:.4f} | n_val_users={int(best['n_users'])}"
+    )
+    return {
+        "best_alpha": best_alpha,
+        "val_curve": val_curve,
+        "n_fit": len(fit_df),
+        "n_val": len(val_df),
+    }
