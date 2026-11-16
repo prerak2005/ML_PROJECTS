@@ -37,6 +37,12 @@ def load_items(path="data/movies.csv", id_col="movieId", name_col="title"):
     return items.set_index(id_col)[name_col]
 
 
+def load_movie_metadata(path: str = "data/movies.csv") -> pd.DataFrame:
+    """Load movieId / title / genres as columns item, title, genres."""
+    meta = pd.read_csv(path)
+    return meta.rename(columns={"movieId": "item"})[["item", "title", "genres"]]
+
+
 # ─────────────────────────────────────────────
 # Preprocessing
 # ─────────────────────────────────────────────
@@ -162,6 +168,126 @@ class SVDRecommender:
         if user in self.recon.index:
             return self.recon.loc[user]
         return pd.Series(self.global_mean, index=self.recon.columns)
+
+
+# ─────────────────────────────────────────────
+# Content-based embeddings
+# ─────────────────────────────────────────────
+
+def build_item_texts(meta: pd.DataFrame, item_ids) -> list[str]:
+    """Build title+genres text for each catalog item_id (same order as item_ids)."""
+    lookup = meta.set_index("item")
+    texts: list[str] = []
+    for item_id in item_ids:
+        row = lookup.loc[item_id]
+        genres = str(row["genres"]).replace("|", ", ")
+        texts.append(f"{row['title']}. Genres: {genres}")
+    return texts
+
+
+def _l2_normalize(mat: np.ndarray, axis: int = 1) -> np.ndarray:
+    """L2-normalise rows (or columns); zero rows stay zero."""
+    norms = np.linalg.norm(mat, axis=axis, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return mat / norms
+
+
+def load_or_compute_item_embeddings(
+    item_ids,
+    texts: list[str],
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cache_path: str = "data/item_embeddings_minilm.npz",
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Return (n_items, dim) embeddings aligned with item_ids.
+
+    Loads from cache_path when item_ids match; otherwise encodes with
+    SentenceTransformer (first run downloads the model) and saves a float32 npz.
+    """
+    from pathlib import Path
+
+    ids_arr = np.asarray(list(item_ids))
+    path = Path(cache_path)
+    if path.exists():
+        cached = np.load(path, allow_pickle=False)
+        cached_ids = cached["item_ids"]
+        if len(cached_ids) == len(ids_arr) and np.array_equal(cached_ids, ids_arr):
+            print(f"embeddings cache HIT: {path}  shape={cached['embeddings'].shape}")
+            return cached["embeddings"].astype(np.float32)
+
+    print(f"embeddings cache MISS — encoding {len(texts)} texts with {model_name}")
+    np.random.seed(seed)
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(model_name)
+    embeddings = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+    ).astype(np.float32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, item_ids=ids_arr, embeddings=embeddings)
+    print(f"embeddings cache SAVED: {path}  shape={embeddings.shape}")
+    return embeddings
+
+
+class ContentEmbeddingRecommender:
+    """
+    Content-based CF: user profile = rating-weighted mean of liked-item embeddings
+    (train rating >= rel_threshold); rank by cosine similarity to catalog items.
+    """
+
+    def fit(
+        self,
+        train_matrix: pd.DataFrame,
+        item_embeddings: np.ndarray,
+        rel_threshold: float = 4.0,
+    ):
+        if item_embeddings.shape[0] != train_matrix.shape[1]:
+            raise ValueError("item_embeddings rows must match train_matrix columns")
+        self.items = train_matrix.columns
+        self.item_index = {item: i for i, item in enumerate(self.items)}
+        self.emb = _l2_normalize(item_embeddings.astype(np.float32), axis=1)
+        self.catalog_mean = _l2_normalize(self.emb.mean(axis=0, keepdims=True), axis=1)[0]
+        self.user_means = train_matrix.mean(axis=1)
+        self.global_mean = float(np.nanmean(train_matrix.values))
+        self.profiles: dict = {}
+
+        for user in train_matrix.index:
+            rated = train_matrix.loc[user].dropna()
+            liked = rated[rated >= rel_threshold]
+            if len(liked) > 0:
+                idxs = [self.item_index[i] for i in liked.index]
+                weights = liked.values.astype(np.float32)
+                profile = (self.emb[idxs] * weights[:, None]).sum(axis=0) / weights.sum()
+            elif len(rated) > 0:
+                idxs = [self.item_index[i] for i in rated.index]
+                profile = self.emb[idxs].mean(axis=0)
+            else:
+                profile = self.catalog_mean.copy()
+            self.profiles[user] = _l2_normalize(profile.reshape(1, -1), axis=1)[0]
+        return self
+
+    def _profile(self, user) -> np.ndarray:
+        if user in self.profiles:
+            return self.profiles[user]
+        return self.catalog_mean
+
+    def score_all(self, user) -> pd.Series:
+        """Cosine similarity of the user profile to every catalog item."""
+        sims = self.emb @ self._profile(user)
+        return pd.Series(sims, index=self.items)
+
+    def predict(self, user, item) -> float:
+        """Map cosine into a soft rating: user_mean + cosine, clipped to [0.5, 5.0]."""
+        um = float(self.user_means.get(user, self.global_mean))
+        if item not in self.item_index:
+            return um
+        sim = float(self.emb[self.item_index[item]] @ self._profile(user))
+        return float(np.clip(um + sim, 0.5, 5.0))
 
 
 # ─────────────────────────────────────────────
