@@ -210,3 +210,111 @@ def recommend(model, train_matrix, user, items_lookup=None, n=10):
     if items_lookup is not None and not out.empty:
         out.insert(1, "title", out["item"].map(items_lookup))
     return out
+
+
+def _dcg_at_k(relevances: list[int], k: int) -> float:
+    """Discounted cumulative gain for a binary relevance list (rank starts at 1)."""
+    return float(sum(rel / np.log2(rank + 1) for rank, rel in enumerate(relevances[:k], start=1)))
+
+
+def ranking_metrics_at_k(
+    model,
+    train_matrix: pd.DataFrame,
+    test_df: pd.DataFrame,
+    k: int = 10,
+    rel_threshold: float = 4.0,
+) -> dict:
+    """
+    Ranking metrics for top-k recommendation lists.
+
+    Protocol
+    --------
+    - Relevant: a test rating is relevant if rating >= rel_threshold (default 4.0).
+    - Candidates: every movie in train_matrix columns that the user did NOT rate
+      in train. Held-out test items that were never rated in train remain candidates.
+    - Users evaluated: users with >= 1 relevant test item AND present in
+      train_matrix.index. Users with relevant test items but no train row are
+      skipped and counted in n_users_skipped.
+    - Metrics (mean over evaluated users): Precision@k, Recall@k, NDCG@k.
+      NDCG uses binary gains; IDCG places min(k, n_relevant) hits in the top ranks.
+    """
+    rel_by_user = (
+        test_df[test_df["rating"] >= rel_threshold]
+        .groupby("user")["item"]
+        .apply(set)
+        .to_dict()
+    )
+    evaluated_users: list = []
+    n_users_skipped = 0
+    precs, recs, ndcgs = [], [], []
+
+    for user, relevant in sorted(rel_by_user.items()):
+        if user not in train_matrix.index:
+            n_users_skipped += 1
+            continue
+        scores = model.score_all(user).copy()
+        seen = train_matrix.loc[user].dropna().index
+        scores = scores.drop(index=seen, errors="ignore")
+        ranked = scores.sort_values(ascending=False).head(k)
+        topk_list = list(ranked.index)
+        topk_set = set(topk_list)
+        hits = len(topk_set & relevant)
+        precs.append(hits / k)
+        recs.append(hits / len(relevant))
+        gains = [1 if item in relevant else 0 for item in topk_list]
+        dcg = _dcg_at_k(gains, k)
+        ideal = _dcg_at_k([1] * min(k, len(relevant)), k)
+        ndcgs.append(dcg / ideal if ideal > 0 else 0.0)
+        evaluated_users.append(user)
+
+    return {
+        "precision@k": float(np.mean(precs)) if precs else 0.0,
+        "recall@k": float(np.mean(recs)) if recs else 0.0,
+        "ndcg@k": float(np.mean(ndcgs)) if ndcgs else 0.0,
+        "k": k,
+        "rel_threshold": rel_threshold,
+        "n_users_evaluated": len(evaluated_users),
+        "n_users_skipped": n_users_skipped,
+        "evaluated_users": evaluated_users,
+    }
+
+
+def leakage_check(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_matrix: pd.DataFrame,
+) -> dict:
+    """
+    Confirm the train/test split does not leak into model fitting.
+
+    Checks
+    ------
+    1. No (user, item) pair appears in both train_df and test_df.
+    2. No test (user, item) cell is already filled in train_matrix
+       (item means / SVD see only this matrix; a filled cell would mean the
+       test rating entered the fit). Zero-filling missing cells is not leakage.
+
+    Prints PASS/FAIL and returns the counts.
+    """
+    train_pairs = set(zip(train_df["user"], train_df["item"]))
+    test_pairs = set(zip(test_df["user"], test_df["item"]))
+    n_overlap_pairs = len(train_pairs & test_pairs)
+
+    n_test_in_matrix = 0
+    for user, item in test_pairs:
+        if user in train_matrix.index and item in train_matrix.columns:
+            if pd.notna(train_matrix.loc[user, item]):
+                n_test_in_matrix += 1
+
+    passed = n_overlap_pairs == 0 and n_test_in_matrix == 0
+    status = "PASS" if passed else "FAIL"
+    print(
+        f"leakage_check: {status} | "
+        f"overlap_pairs={n_overlap_pairs} | "
+        f"test_cells_filled_in_train_matrix={n_test_in_matrix}"
+    )
+    return {
+        "passed": passed,
+        "n_overlap_pairs": n_overlap_pairs,
+        "n_test_in_matrix": n_test_in_matrix,
+    }
